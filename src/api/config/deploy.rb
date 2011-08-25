@@ -75,7 +75,6 @@ end
 namespace :deploy do
   task :restart do
     run "touch #{current_path}/tmp/restart.txt"
-    run "sv 1 /service/delayed_job_frontend"
   end
 
   task :use_subdir do
