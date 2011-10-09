@@ -78,9 +78,6 @@
               <%= link_to 'Report Bug', bugzilla_url(@bugowners_mail, "#{@project.name}/#{@package.name}: Bug") %>
             </li>
           <% end %>
-          <li>
-            <%= image_tag 'icons/application_get.png' %> <a href="http://software.opensuse.org/download.html?prj=<%= @project %>&amp;pkg=<%= @package %>">Download package</a>
-          </li>
           <% if session[:login] %>
             <% if Package.current_rev(@project, @package) %>
               <li>
