@@ -291,10 +291,39 @@ class RequestController < ApplicationController
           newPackages = Array.new
           newTargets = Array.new
           packages.each do |pkg|
-            # find target via linkinfo or submit to all
-            data = REXML::Document.new( backend_get("/source/#{CGI.escape(pkg.db_project.name)}/#{CGI.escape(pkg.name)}") )
-            e = data.elements["directory/linkinfo"]
-            unless e and DbPackage.exists_by_project_and_name( e.attributes["project"], e.attributes["package"], follow_project_links=true, allow_remote_packages=true)
+            # find target via linkinfo or submit to all.
+            # FIXME: this is currently handling local project links for packages with multiple spec files. 
+            #        This can be removed when we handle this as shadow packages in the backend.
+            tprj = pkg.db_project.name
+            tpkg = pkg.name
+            rev=nil
+            if action.source.has_attribute? 'rev'
+              rev = action.source.rev.to_s
+            end
+            while tprj == pkg.db_project.name
+              data = REXML::Document.new( backend_get("/source/#{CGI.escape(tprj)}/#{CGI.escape(tpkg)}") )
+              e = data.elements["directory/linkinfo"]
+              if e
+                tprj = e.attributes["project"]
+                tpkg = e.attributes["package"]
+                if action.value("type") == "maintenance_release" and not rev
+                  # maintenance_release needs the binaries, so we always use the current source
+                  if e.attributes["xsrcmd5"]
+                    rev=e.attributes["xsrcmd5"]
+                  elsif e.attributes["srcmd5"]
+                    rev=e.attributes["srcmd5"]
+                  else
+                    render_error :status => 400, :errorcode => 'broken_source',
+                      :message => "Current sources are broken"
+                    return
+                  end
+                end
+              else
+                tprj = tpkg = nil
+              end
+            end
+            # Will this be a new package ?
+            unless e and DbPackage.exists_by_project_and_name( tprj, tpkg, follow_project_links=true, allow_remote_packages=true)
               if action.value("type") == "maintenance_release"
                 newPackages << pkg.name
                 next
@@ -304,33 +333,21 @@ class RequestController < ApplicationController
                 return
               end
             end
-            newTargets << e.attributes["project"]
-            newAction = action.clone
+            newTargets << tprj
+            newAction = ActiveXML::XMLNode.new(action.dump_xml)
             newAction.add_element 'target' unless newAction.has_element? 'target'
             newAction.source.set_attribute("package", pkg.name)
-            newAction.target.set_attribute("project", e.attributes["project"])
-            newAction.target.set_attribute("package", e.attributes["package"] + incident_suffix)
-            if action.value("type") == "maintenance_release" and not newAction.source.has_attribute? 'rev'
-              # maintenance_release needs the binaries, so we always use the current source
-              rev=nil
-              if e.attributes["xsrcmd5"]
-                rev=e.attributes["xsrcmd5"]
-              elsif e.attributes["srcmd5"]
-                rev=e.attributes["srcmd5"]
-              else
-                render_error :status => 400, :errorcode => 'broken_source',
-                  :message => "Current sources are broken"
-                return
-              end
-              newAction.source.set_attribute("rev", rev)
-            end
+            newAction.target.set_attribute("project", tprj )
+            newAction.target.set_attribute("package", tpkg + incident_suffix)
+            newAction.source.set_attribute("rev", rev) if rev
             req.add_node newAction.dump_xml
           end
 
           # new packages (eg patchinfos) go to all target projects by default in maintenance requests
+          newTargets.uniq!
           newPackages.each do |pkg|
             newTargets.each do |p|
-              newAction = action.clone
+              newAction = ActiveXML::XMLNode.new(action.dump_xml)
               newAction.add_element 'target' unless newAction.has_element? 'target'
               newAction.source.set_attribute("package", pkg)
               newAction.target.set_attribute("project", p)
@@ -668,61 +685,76 @@ class RequestController < ApplicationController
 
     req.each_action do |action|
       action_diff = ''
-      if ['submit', 'maintenance_release'].include?(action.value('type')) and action.target.project and action.target.package
-        target_project = action.target.project
-        target_package = action.target.package
-
-        # Cut off '.$FOO' from package name ($FOO is the release target) when it's a maintenance release.
-        # Ruby has no 'rsplit' method, needs elitist hack:
-        target_package = target_package.split(/\.([^.]*)$/)[0] if action.value('type') == 'maintenance_release'
-
-        path = nil
-        if action.has_element? :acceptinfo
-          # OBS 2.1 adds acceptinfo on request accept
-          path = "/source/%s/%s?cmd=diff" %
-               [CGI.escape(target_project), CGI.escape(target_package)]
-          if action.acceptinfo.value("xsrcmd5")
-            path += "&rev=" + action.acceptinfo.value("xsrcmd5")
-          else
-            path += "&rev=" + action.acceptinfo.value("srcmd5")
-          end
-          if action.acceptinfo.value("oxsrcmd5")
-            path += "&orev=" + action.acceptinfo.value("oxsrcmd5")
-          elsif action.acceptinfo.value("osrcmd5")
-            path += "&orev=" + action.acceptinfo.value("osrcmd5")
-          else
-            # md5sum of empty package
-            path += "&orev=d41d8cd98f00b204e9800998ecf8427e"
-          end
+      if ['submit', 'maintenance_release', 'maintenance_incident'].include?(action.value('type'))
+        spkgs = []
+        if action.source.has_attribute? :package
+          spkgs << DbPackage.get_by_project_and_name( action.source.project, action.source.package )
         else
-          # for requests not yet accepted or accepted with OBS 2.0 and before
-          spkg = DbPackage.get_by_project_and_name( action.source.project, action.source.package )
-          tpkg = linked_tpkg = nil
-          if DbPackage.exists_by_project_and_name( target_project, target_package, follow_project_links = false )
-            tpkg = DbPackage.get_by_project_and_name( target_project, target_package )
-          elsif DbPackage.exists_by_project_and_name( target_project, target_package, follow_project_links = true )
-            tpkg = linked_tpkg = DbPackage.get_by_project_and_name( target_project, target_package )
-          else
-            tprj = DbProject.get_by_name( target_project )
-          end
-
-          path = "/source/#{CGI.escape(action.source.project)}/#{CGI.escape(action.source.package)}?cmd=diff&expand=1"
-          if tpkg
-            path += "&oproject=#{CGI.escape(target_project)}&opackage=#{CGI.escape(target_package)}"
-            path += "&rev=#{action.source.rev}" if action.source.value('rev')
-          else
-            # No target means diffing all source package changes (rev 0 - rev latest)
-            spkg_rev = Directory.find(:project => action.source.project, :package => action.source.package).rev
-            path += "&orev=0&rev=#{spkg_rev}"
-          end
+          spkgs = DbProject.get_by_name( action.source.project ).db_packages
         end
 
-        if path
-          path += '&unified=1' if params[:view] == 'xml' # Request unified diff in full XML view
-          begin
-            action_diff += Suse::Backend.post(path, nil).body
-          rescue ActiveXML::Transport::Error => e
-            render_error :status => 404, :errorcode => 'diff_failure', :message => "The diff call for #{path} failed" and return
+        spkgs.each do |spkg|
+          target_project = target_package = nil
+          if action.has_element? :target
+            target_project = action.target.project
+            target_package = action.target.package if action.target.has_attribute? :package
+          end
+
+          if target_package.nil?
+            data = REXML::Document.new( backend_get("/source/#{CGI.escape(action.source.project)}/#{CGI.escape(spkg.name)}") )
+            e = data.elements["directory/linkinfo"]
+            if e
+              target_project = e.attributes["project"]
+              target_package = e.attributes["package"]
+            end
+          end
+
+          path = nil
+          if action.has_element? :acceptinfo
+            # OBS 2.1 adds acceptinfo on request accept
+            path = "/source/%s/%s?cmd=diff" % [CGI.escape(target_project), CGI.escape(target_package)]
+            if action.acceptinfo.value("xsrcmd5")
+              path += "&rev=" + action.acceptinfo.value("xsrcmd5")
+            else
+              path += "&rev=" + action.acceptinfo.value("srcmd5")
+            end
+            if action.acceptinfo.value("oxsrcmd5")
+              path += "&orev=" + action.acceptinfo.value("oxsrcmd5")
+            elsif action.acceptinfo.value("osrcmd5")
+              path += "&orev=" + action.acceptinfo.value("osrcmd5")
+            else
+              # md5sum of empty package
+              path += "&orev=d41d8cd98f00b204e9800998ecf8427e"
+            end
+          else
+            # for requests not yet accepted or accepted with OBS 2.0 and before
+            tpkg = linked_tpkg = nil
+            if DbPackage.exists_by_project_and_name( target_project, target_package, follow_project_links = false )
+              tpkg = DbPackage.get_by_project_and_name( target_project, target_package )
+            elsif DbPackage.exists_by_project_and_name( target_project, target_package, follow_project_links = true )
+              tpkg = linked_tpkg = DbPackage.get_by_project_and_name( target_project, target_package )
+            else
+              tprj = DbProject.get_by_name( target_project )
+            end
+
+            path = "/source/#{CGI.escape(action.source.project)}/#{CGI.escape(spkg.name)}?cmd=diff&expand=1&filelimit=0"
+            if tpkg
+              path += "&oproject=#{CGI.escape(target_project)}&opackage=#{CGI.escape(target_package)}"
+              path += "&rev=#{action.source.rev}" if action.source.value('rev')
+            else
+              # No target means diffing all source package changes (rev 0 - rev latest)
+              spkg_rev = Directory.find(:project => action.source.project, :package => spkg.name).rev
+              path += "&orev=0&rev=#{spkg_rev}"
+            end
+          end
+
+          if path
+            path += '&view=xml' if params[:view] == 'xml' # Request unified diff in full XML view
+            begin
+              action_diff += Suse::Backend.post(path, nil).body
+            rescue ActiveXML::Transport::Error => e
+              render_error :status => 404, :errorcode => 'diff_failure', :message => "The diff call for #{path} failed" and return
+            end
           end
         end
       end
